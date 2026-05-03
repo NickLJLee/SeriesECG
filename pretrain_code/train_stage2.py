@@ -5,10 +5,13 @@ import os
 from pathlib import Path
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from pretrain_code.data import PatientECGDataset, collate_patient_batch
+from pretrain_code.distributed import cleanup_distributed, is_main_process, setup_distributed, unwrap_model
 from pretrain_code.models import ECGPatientModel, ECGTokenEncoder
 
 
@@ -104,7 +107,10 @@ def save_checkpoint(model: ECGPatientModel, optimizer: torch.optim.Optimizer, pa
 
 def main() -> None:
     args = parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    dist_ctx = setup_distributed(args.device)
+    args.device = str(dist_ctx.device)
+    if is_main_process(dist_ctx):
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     dataset = PatientECGDataset(
         args.manifest,
         ecg_root=args.ecg_root or None,
@@ -122,12 +128,14 @@ def main() -> None:
     if not label_columns:
         raise ValueError("--label_columns did not resolve to any manifest columns.")
     args.label_columns = ",".join(label_columns)
+    sampler = DistributedSampler(dataset, shuffle=True) if dist_ctx.enabled else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=dist_ctx.device.type == "cuda",
         collate_fn=collate_patient_batch,
     )
     encoder = build_encoder(args)
@@ -136,10 +144,16 @@ def main() -> None:
         output_dim=len(label_columns),
         patient_layers=args.patient_layers,
         patient_heads=encoder.n_heads,
-    ).to(args.device)
+    ).to(dist_ctx.device)
     if args.freeze_record_encoder:
         for param in model.record_encoder.parameters():
             param.requires_grad = False
+    if dist_ctx.enabled:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist_ctx.local_rank] if dist_ctx.device.type == "cuda" else None,
+            output_device=dist_ctx.local_rank if dist_ctx.device.type == "cuda" else None,
+        )
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
         lr=args.lr,
@@ -147,15 +161,17 @@ def main() -> None:
     )
 
     for epoch in range(args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
-        loop = tqdm(loader, desc=f"stage2 epoch {epoch}")
+        loop = tqdm(loader, desc=f"stage2 epoch {epoch}", disable=not is_main_process(dist_ctx))
         loss_sum = 0.0
         steps = 0
         for batch in loop:
-            records = batch["records"].to(args.device, non_blocking=True)
-            record_padding_mask = batch["record_padding_mask"].to(args.device, non_blocking=True)
-            labels = batch["labels"].to(args.device, non_blocking=True)
-            label_mask = batch["label_mask"].to(args.device, non_blocking=True)
+            records = batch["records"].to(dist_ctx.device, non_blocking=True)
+            record_padding_mask = batch["record_padding_mask"].to(dist_ctx.device, non_blocking=True)
+            labels = batch["labels"].to(dist_ctx.device, non_blocking=True)
+            label_mask = batch["label_mask"].to(dist_ctx.device, non_blocking=True)
             out = model(records, record_padding_mask=record_padding_mask)
             loss = masked_bce_loss(out["logits"], labels, label_mask)
             optimizer.zero_grad(set_to_none=True)
@@ -164,12 +180,16 @@ def main() -> None:
             optimizer.step()
             loss_sum += float(loss.item())
             steps += 1
-            loop.set_postfix(loss=f"{loss.item():.4f}")
-        print(f"epoch={epoch} mean_loss={loss_sum / max(1, steps):.6f}")
-        if args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
-            save_checkpoint(model, optimizer, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch + 1}.pt"), epoch, args)
+            if is_main_process(dist_ctx):
+                loop.set_postfix(loss=f"{loss.item():.4f}")
+        if is_main_process(dist_ctx):
+            print(f"epoch={epoch} mean_loss={loss_sum / max(1, steps):.6f}")
+        if is_main_process(dist_ctx) and args.save_every_epochs > 0 and (epoch + 1) % args.save_every_epochs == 0:
+            save_checkpoint(unwrap_model(model), optimizer, os.path.join(args.output_dir, f"checkpoint_epoch_{epoch + 1}.pt"), epoch, args)
 
-    save_checkpoint(model, optimizer, os.path.join(args.output_dir, "checkpoint_final.pt"), args.epochs, args)
+    if is_main_process(dist_ctx):
+        save_checkpoint(unwrap_model(model), optimizer, os.path.join(args.output_dir, "checkpoint_final.pt"), args.epochs, args)
+    cleanup_distributed(dist_ctx)
 
 
 if __name__ == "__main__":

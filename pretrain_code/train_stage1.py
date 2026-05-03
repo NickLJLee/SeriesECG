@@ -5,10 +5,13 @@ import os
 from pathlib import Path
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from pretrain_code.data import ECGManifestDataset, collate_record_batch
+from pretrain_code.distributed import cleanup_distributed, is_main_process, setup_distributed, unwrap_model
 from pretrain_code.models import ECGSSLModel, ECGTokenEncoder
 from pretrain_code.models.ssl_model import cosine_teacher_momentum
 
@@ -69,7 +72,10 @@ def save_checkpoint(model: ECGSSLModel, optimizer: torch.optim.Optimizer, path: 
 
 def main() -> None:
     args = parse_args()
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    dist_ctx = setup_distributed(args.device)
+    args.device = str(dist_ctx.device)
+    if is_main_process(dist_ctx):
+        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     dataset = ECGManifestDataset(
         args.manifest,
         ecg_root=args.ecg_root or None,
@@ -82,12 +88,14 @@ def main() -> None:
         path_index=args.path_index or None,
         include_text=False,
     )
+    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True) if dist_ctx.enabled else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=dist_ctx.device.type == "cuda",
         collate_fn=collate_record_batch,
         drop_last=True,
     )
@@ -98,34 +106,45 @@ def main() -> None:
         n_layers=args.n_layers,
         patch_samples=args.patch_samples,
     )
-    model = ECGSSLModel(encoder, output_dim=args.output_dim).to(args.device)
+    model = ECGSSLModel(encoder, output_dim=args.output_dim).to(dist_ctx.device)
+    if dist_ctx.enabled:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist_ctx.local_rank] if dist_ctx.device.type == "cuda" else None,
+            output_device=dist_ctx.local_rank if dist_ctx.device.type == "cuda" else None,
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = max(1, len(loader) * args.epochs)
     global_step = 0
 
     for epoch in range(args.epochs):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
-        loop = tqdm(loader, desc=f"stage1 epoch {epoch}")
+        loop = tqdm(loader, desc=f"stage1 epoch {epoch}", disable=not is_main_process(dist_ctx))
         for batch in loop:
-            ecg = batch["ecg"].to(args.device, non_blocking=True)
+            ecg = batch["ecg"].to(dist_ctx.device, non_blocking=True)
             out = model(ecg)
             optimizer.zero_grad(set_to_none=True)
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.3)
             optimizer.step()
-            model.update_teacher(cosine_teacher_momentum(global_step, total_steps))
-            loop.set_postfix(loss=f"{out['loss'].item():.4f}", mim=f"{out['loss_mim'].item():.4f}")
+            unwrap_model(model).update_teacher(cosine_teacher_momentum(global_step, total_steps))
+            if is_main_process(dist_ctx):
+                loop.set_postfix(loss=f"{out['loss'].item():.4f}", mim=f"{out['loss_mim'].item():.4f}")
             global_step += 1
-            if args.save_every > 0 and global_step % args.save_every == 0:
+            if is_main_process(dist_ctx) and args.save_every > 0 and global_step % args.save_every == 0:
                 save_checkpoint(
-                    model,
+                    unwrap_model(model),
                     optimizer,
                     os.path.join(args.output_dir, f"checkpoint_step_{global_step}.pt"),
                     global_step,
                     args,
                 )
 
-    save_checkpoint(model, optimizer, os.path.join(args.output_dir, "checkpoint_final.pt"), global_step, args)
+    if is_main_process(dist_ctx):
+        save_checkpoint(unwrap_model(model), optimizer, os.path.join(args.output_dir, "checkpoint_final.pt"), global_step, args)
+    cleanup_distributed(dist_ctx)
 
 
 if __name__ == "__main__":
