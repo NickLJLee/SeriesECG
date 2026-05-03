@@ -4,8 +4,9 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as checkpoint_fn
+
+from .attention import scaled_dot_product_attention
 
 
 def _get_alibi_slopes(n_heads: int) -> torch.Tensor:
@@ -87,7 +88,7 @@ class ECGTransformerBlock(nn.Module):
         v = self.v_proj(x_norm).reshape(batch_size, token_count, self.n_heads, self.head_dim).transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        attn = F.scaled_dot_product_attention(
+        attn = scaled_dot_product_attention(
             q,
             k,
             v,

@@ -25,8 +25,10 @@ def encoder_config(encoder: ECGTokenEncoder) -> dict[str, int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 2 patient-aware ECG supervised alignment.")
     parser.add_argument("--manifest", required=True, help="CSV with ECG paths, patient IDs, and label columns.")
-    parser.add_argument("--label_columns", required=True, help="Comma-separated multi-label target columns.")
+    parser.add_argument("--label_columns", required=True, help="Comma-separated multi-label targets, or all_icd_i.")
     parser.add_argument("--ecg_root", default="")
+    parser.add_argument("--ecg_layout", default="auto", choices=("auto", "heedb_wfdb", "flat"))
+    parser.add_argument("--path_index", default="", help="Optional CSV cache mapping record IDs to ECG file paths.")
     parser.add_argument("--teacher_checkpoint", default="", help="Stage 1 checkpoint containing teacher_encoder.")
     parser.add_argument("--output_dir", default="outputs/ecg_stage2")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -103,17 +105,23 @@ def save_checkpoint(model: ECGPatientModel, optimizer: torch.optim.Optimizer, pa
 def main() -> None:
     args = parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    label_columns = [column.strip() for column in args.label_columns.split(",") if column.strip()]
     dataset = PatientECGDataset(
         args.manifest,
         ecg_root=args.ecg_root or None,
-        label_columns=label_columns,
+        label_columns=args.label_columns,
         max_records_per_case=args.max_records_per_case,
         lead_num=args.lead_num,
         window_size=args.window_size,
         target_fs=args.target_fs,
         apply_filter=not args.no_filter,
+        ecg_layout=args.ecg_layout,
+        path_index=args.path_index or None,
+        include_text=False,
     )
+    label_columns = dataset.record_dataset.label_columns
+    if not label_columns:
+        raise ValueError("--label_columns did not resolve to any manifest columns.")
+    args.label_columns = ",".join(label_columns)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

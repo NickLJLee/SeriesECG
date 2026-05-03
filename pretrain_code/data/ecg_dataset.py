@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-from collections import defaultdict
 from pathlib import Path
+import re
 from typing import Sequence
 
 import numpy as np
@@ -11,6 +11,9 @@ import torch
 from torch.utils.data import Dataset
 
 from .ecg_io import preprocess_record
+
+_ICD_I_RE = re.compile(r"^I[0-9A-Z]{2}$")
+_SORT_COLUMN_CANDIDATES = ("record_time", "acquisition_time", "date", "timestamp")
 
 
 def _split_columns(value: str | Sequence[str] | None) -> list[str]:
@@ -38,6 +41,118 @@ def _first_existing_column(columns: Sequence[str], candidates: Sequence[str]) ->
     return None
 
 
+def _read_manifest_columns(manifest_path: str | os.PathLike[str]) -> list[str]:
+    return list(pd.read_csv(manifest_path, nrows=0).columns)
+
+
+def _expand_label_columns(value: str | Sequence[str] | None, columns: Sequence[str]) -> list[str]:
+    requested = _split_columns(value)
+    if len(requested) == 1 and requested[0].lower() == "all_icd_i":
+        return [column for column in columns if _ICD_I_RE.match(str(column))]
+    return requested
+
+
+def _record_key(raw_path: object) -> str:
+    text = str(raw_path)
+    if not text:
+        return text
+    return Path(text).stem
+
+
+def _has_records_file(root: str | os.PathLike[str] | None) -> bool:
+    if not root:
+        return False
+    root_path = Path(root)
+    if not root_path.exists():
+        return False
+    try:
+        next(root_path.rglob("RECORDS"))
+        return True
+    except StopIteration:
+        return False
+
+
+def _normalize_ecg_layout(layout: str, ecg_root: str | os.PathLike[str] | None) -> str:
+    normalized = layout.lower()
+    if normalized not in {"auto", "heedb_wfdb", "flat"}:
+        raise ValueError("--ecg_layout must be one of: auto, heedb_wfdb, flat.")
+    if normalized == "auto":
+        return "heedb_wfdb" if _has_records_file(ecg_root) else "flat"
+    return normalized
+
+
+def _load_path_index(path: str | os.PathLike[str]) -> dict[str, str]:
+    index_path = Path(path)
+    if not index_path.exists():
+        return {}
+    frame = pd.read_csv(index_path, usecols=["record_id", "path"])
+    return dict(zip(frame["record_id"].astype(str), frame["path"].astype(str)))
+
+
+def _save_path_index(path: str | os.PathLike[str], index: dict[str, str]) -> None:
+    index_path = Path(path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame({"record_id": list(index.keys()), "path": list(index.values())})
+    frame.to_csv(index_path, index=False)
+
+
+def _build_heedb_wfdb_index(
+    ecg_root: str | os.PathLike[str],
+    wanted_records: set[str] | None = None,
+) -> dict[str, str]:
+    root = Path(ecg_root)
+    index: dict[str, str] = {}
+    saw_records = False
+    for records_path in root.rglob("RECORDS"):
+        saw_records = True
+        base_dir = records_path.parent
+        try:
+            with records_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    record = line.strip().split()
+                    if not record:
+                        continue
+                    record_name = record[0]
+                    record_id = Path(record_name).stem
+                    if wanted_records is not None and record_id not in wanted_records:
+                        continue
+                    signal_path = base_dir / record_name
+                    if signal_path.suffix.lower() not in {".mat", ".hea"}:
+                        signal_path = signal_path.with_suffix(".mat")
+                    elif signal_path.suffix.lower() == ".hea":
+                        signal_path = signal_path.with_suffix(".mat")
+                    index[record_id] = str(signal_path)
+        except OSError:
+            continue
+    if saw_records:
+        return index
+
+    for hea_path in root.rglob("*.hea"):
+        record_id = hea_path.stem
+        if wanted_records is not None and record_id not in wanted_records:
+            continue
+        index[record_id] = str(hea_path.with_suffix(".mat"))
+    return index
+
+
+def _resolve_path_index(
+    *,
+    ecg_root: str | os.PathLike[str] | None,
+    path_index: str | os.PathLike[str] | None,
+    wanted_records: set[str] | None,
+) -> dict[str, str]:
+    index = _load_path_index(path_index) if path_index else {}
+    missing_records = None
+    if wanted_records is not None:
+        missing_records = wanted_records.difference(index)
+    if ecg_root and (not index or (missing_records is not None and missing_records)):
+        built = _build_heedb_wfdb_index(ecg_root, wanted_records=missing_records or wanted_records)
+        index.update(built)
+        if path_index:
+            _save_path_index(path_index, index)
+    return index
+
+
 class ECGManifestDataset(Dataset):
     """Record-level ECG dataset driven by a CSV manifest."""
 
@@ -60,33 +175,39 @@ class ECGManifestDataset(Dataset):
         normalize: str = "per_lead",
         apply_filter: bool = True,
         drop_missing: bool = True,
+        ecg_layout: str = "auto",
+        path_index: str | os.PathLike[str] | None = None,
+        extra_columns: Sequence[str] | None = None,
+        include_text: bool = True,
     ) -> None:
         self.manifest_path = str(manifest_path)
         self.ecg_root = str(ecg_root) if ecg_root else None
-        self.data = pd.read_csv(manifest_path)
+        self.manifest_columns = _read_manifest_columns(manifest_path)
         self.path_column = path_column or _first_existing_column(
-            self.data.columns,
+            self.manifest_columns,
             ("path", "ecg_path", "record_path", "filename", "HashFileName"),
         )
         if self.path_column is None:
             raise ValueError("Manifest must contain a path/ecg_path/record_path/filename column.")
         self.record_id_column = record_id_column or _first_existing_column(
-            self.data.columns,
+            self.manifest_columns,
             ("record_id", "sample_id", "HashFileName", "filename"),
         )
         self.patient_id_column = patient_id_column or _first_existing_column(
-            self.data.columns,
+            self.manifest_columns,
             ("patient_id", "PatientID", "BDSPPatientID", "case_id"),
         )
-        self.text_column = text_column or _first_existing_column(
-            self.data.columns,
-            ("text", "txt", "diagnosis", "deid_t_diagnosis_original", "deid_t_diagnosis", "ICD_text"),
-        )
+        self.text_column = None
+        if include_text:
+            self.text_column = text_column or _first_existing_column(
+                self.manifest_columns,
+                ("text", "txt", "diagnosis", "deid_t_diagnosis_original", "deid_t_diagnosis", "ICD_text"),
+            )
         self.sample_rate_column = sample_rate_column or _first_existing_column(
-            self.data.columns,
+            self.manifest_columns,
             ("sample_rate", "fs", "sampling_rate"),
         )
-        self.label_columns = _split_columns(label_columns)
+        self.label_columns = _expand_label_columns(label_columns, self.manifest_columns)
         self.signal_key = signal_key
         self.target_fs = target_fs
         self.lead_num = lead_num
@@ -94,24 +215,73 @@ class ECGManifestDataset(Dataset):
         self.crop = crop
         self.normalize = normalize
         self.apply_filter = apply_filter
+        self.ecg_layout = _normalize_ecg_layout(ecg_layout, self.ecg_root)
+        self.path_index_path = str(path_index) if path_index else None
+        self.resolved_path_column = "__resolved_ecg_path"
+
+        usecols = {
+            column
+            for column in (
+                self.path_column,
+                self.record_id_column,
+                self.patient_id_column,
+                self.text_column,
+                self.sample_rate_column,
+                *self.label_columns,
+                *_SORT_COLUMN_CANDIDATES,
+                *(extra_columns or ()),
+            )
+            if column and column in self.manifest_columns
+        }
+        self.data = pd.read_csv(manifest_path, usecols=list(usecols))
 
         if drop_missing:
-            keep = []
-            for _, row in self.data.iterrows():
-                path = _resolve_path(row[self.path_column], self.ecg_root)
-                if Path(path).exists():
-                    keep.append(True)
-                    continue
-                if Path(path).with_suffix(".mat").exists():
-                    keep.append(True)
-                    continue
-                keep.append(False)
-            self.data = self.data.loc[keep].reset_index(drop=True)
+            self._drop_missing_records()
+        elif self.ecg_layout == "heedb_wfdb":
+            self._attach_heedb_paths(drop_missing=False)
 
     def __len__(self) -> int:
         return len(self.data)
 
+    def _attach_heedb_paths(self, *, drop_missing: bool) -> None:
+        record_ids = self.data[self.path_column].map(_record_key).astype(str)
+        wanted_records = set(record_ids.unique())
+        index = _resolve_path_index(
+            ecg_root=self.ecg_root,
+            path_index=self.path_index_path,
+            wanted_records=wanted_records,
+        )
+        resolved = record_ids.map(index)
+        self.data[self.resolved_path_column] = resolved
+        if drop_missing:
+            self.data = self.data.loc[resolved.notna()].reset_index(drop=True)
+
+    def _drop_missing_records(self) -> None:
+        if self.ecg_layout == "heedb_wfdb":
+            self._attach_heedb_paths(drop_missing=True)
+            return
+
+        keep = []
+        resolved = []
+        for _, row in self.data.iterrows():
+            path = _resolve_path(row[self.path_column], self.ecg_root)
+            if Path(path).exists():
+                keep.append(True)
+                resolved.append(path)
+                continue
+            mat_path = str(Path(path).with_suffix(".mat"))
+            if Path(mat_path).exists():
+                keep.append(True)
+                resolved.append(mat_path)
+                continue
+            keep.append(False)
+            resolved.append(path)
+        self.data[self.resolved_path_column] = resolved
+        self.data = self.data.loc[keep].reset_index(drop=True)
+
     def _row_path(self, row: pd.Series) -> str:
+        if self.resolved_path_column in row.index and not pd.isna(row[self.resolved_path_column]):
+            return str(row[self.resolved_path_column])
         path = _resolve_path(row[self.path_column], self.ecg_root)
         if Path(path).exists():
             return path
@@ -175,35 +345,40 @@ class PatientECGDataset(Dataset):
         record_sort_column: str | None = None,
         **record_dataset_kwargs,
     ) -> None:
+        manifest_columns = _read_manifest_columns(manifest_path)
+        inferred_case_column = case_id_column or _first_existing_column(
+            manifest_columns,
+            ("case_id", "patient_id", "PatientID", "BDSPPatientID"),
+        )
+        inferred_sort_column = record_sort_column or _first_existing_column(
+            manifest_columns,
+            _SORT_COLUMN_CANDIDATES,
+        )
         self.record_dataset = ECGManifestDataset(
             manifest_path,
             ecg_root=ecg_root,
             drop_missing=record_dataset_kwargs.pop("drop_missing", True),
+            extra_columns=[column for column in (inferred_case_column, inferred_sort_column) if column],
             **record_dataset_kwargs,
         )
         data = self.record_dataset.data
-        self.case_id_column = case_id_column or _first_existing_column(
-            data.columns,
-            ("case_id", "patient_id", "PatientID", "BDSPPatientID"),
-        )
+        self.case_id_column = inferred_case_column
         if self.case_id_column is None:
             self.case_id_column = self.record_dataset.record_id_column or self.record_dataset.path_column
         self.max_records_per_case = max(1, int(max_records_per_case))
-        self.record_sort_column = record_sort_column or _first_existing_column(
-            data.columns,
-            ("record_time", "acquisition_time", "date", "timestamp"),
-        )
+        self.record_sort_column = inferred_sort_column if inferred_sort_column in data.columns else None
 
-        groups: dict[str, list[int]] = defaultdict(list)
-        for idx, row in data.iterrows():
-            groups[str(row[self.case_id_column])].append(idx)
-        self.case_ids = sorted(groups.keys())
+        if self.record_sort_column:
+            ordered = data.sort_values([self.case_id_column, self.record_sort_column], kind="mergesort")
+        else:
+            ordered = data
+        self.case_ids = []
         self.groups = []
-        for case_id in self.case_ids:
-            indices = groups[case_id]
-            if self.record_sort_column:
-                indices = sorted(indices, key=lambda i: str(data.iloc[i][self.record_sort_column]))
-            self.groups.append(indices[: self.max_records_per_case])
+        for case_id, frame in ordered.groupby(self.case_id_column, sort=True):
+            indices = list(frame.index)
+            selected = indices[-self.max_records_per_case :]
+            self.case_ids.append(str(case_id))
+            self.groups.append(selected)
 
     def __len__(self) -> int:
         return len(self.groups)
@@ -212,14 +387,13 @@ class PatientECGDataset(Dataset):
         indices = self.groups[idx]
         samples = [self.record_dataset[i] for i in indices]
         records = torch.stack([sample["ecg"] for sample in samples], dim=0)
-        labels = samples[0]["labels"].clone()
-        label_mask = samples[0]["label_mask"].clone()
-        for sample in samples[1:]:
-            sample_mask = sample["label_mask"]
-            fill = ~label_mask & sample_mask
-            if fill.any():
-                labels[fill] = sample["labels"][fill]
-                label_mask[fill] = True
+        labels = torch.stack([sample["labels"] for sample in samples], dim=0)
+        label_masks = torch.stack([sample["label_mask"] for sample in samples], dim=0)
+        label_mask = label_masks.any(dim=0)
+        if labels.numel():
+            labels = torch.where(label_masks, labels, torch.zeros_like(labels)).amax(dim=0)
+        else:
+            labels = torch.empty(0, dtype=torch.float32)
         return {
             "records": records,
             "labels": labels,

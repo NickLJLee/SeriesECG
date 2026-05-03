@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 1 ECG masked self-distillation pretraining.")
     parser.add_argument("--manifest", required=True, help="CSV with at least a path/ecg_path column.")
     parser.add_argument("--ecg_root", default="", help="Optional root directory for relative ECG paths.")
+    parser.add_argument("--ecg_layout", default="auto", choices=("auto", "heedb_wfdb", "flat"))
+    parser.add_argument("--path_index", default="", help="Optional CSV cache mapping record IDs to ECG file paths.")
     parser.add_argument("--output_dir", default="outputs/ecg_stage1")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=50)
@@ -76,6 +78,9 @@ def main() -> None:
         target_fs=args.target_fs,
         crop="random",
         apply_filter=not args.no_filter,
+        ecg_layout=args.ecg_layout,
+        path_index=args.path_index or None,
+        include_text=False,
     )
     loader = DataLoader(
         dataset,

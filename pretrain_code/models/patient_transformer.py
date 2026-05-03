@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from .attention import scaled_dot_product_attention
 
 
 class PatientTransformerBlock(nn.Module):
@@ -37,7 +38,7 @@ class PatientTransformerBlock(nn.Module):
         if key_padding_mask is not None:
             attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
             attn_mask = torch.where(attn_mask, float("-inf"), 0.0).to(dtype=q.dtype)
-        attn = F.scaled_dot_product_attention(
+        attn = scaled_dot_product_attention(
             q,
             k,
             v,
@@ -106,4 +107,3 @@ class PatientAggregator(nn.Module):
         for block in self.blocks:
             x = block(x, key_padding_mask=key_padding_mask)
         return self.norm(x)[:, 0]
-
