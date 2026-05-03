@@ -1,0 +1,14 @@
+manifest: /path/to/ecg_manifest.csv
+ecg_root: /path/to/ecg/files
+output_dir: outputs/ecg_stage1
+batch_size: 32
+epochs: 50
+lr: 0.0005
+lead_num: 12
+window_size: 5000
+target_fs: 500
+d_model: 384
+n_heads: 6
+n_layers: 6
+patch_samples: 250
+

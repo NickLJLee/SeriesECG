@@ -1,0 +1,17 @@
+manifest: /path/to/ecg_manifest.csv
+ecg_root: /path/to/ecg/files
+label_columns: atrial_fibrillation,bundle_branch_block,myocardial_infarction,ischemia
+teacher_checkpoint: outputs/ecg_stage1/checkpoint_final.pt
+output_dir: outputs/ecg_stage2
+batch_size: 8
+epochs: 20
+lr: 0.00005
+max_records_per_case: 8
+lead_num: 12
+window_size: 5000
+target_fs: 500
+d_model: 384
+n_heads: 6
+n_layers: 6
+patch_samples: 250
+
